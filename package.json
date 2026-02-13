@@ -1,0 +1,16 @@
+{
+  "name": "tradelocker-bubble-bridge",
+  "version": "1.0.0",
+  "description": "TradeLocker BrandSocket → Bubble webhook bridge",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.4",
+    "socket.io-client": "^4.8.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
