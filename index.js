@@ -10,9 +10,9 @@ const CONFIG = {
   TYPE: "DEMO",
   BRAND_API_KEY: process.env.BRAND_API_KEY,
 
-  // Bubble
-  BUBBLE_WEBHOOK_URL: process.env.BUBBLE_WEBHOOK_URL,
-  // Example: https://yourapp.bubbleapps.io/version-test/api/1.1/wf/tradelocker-update
+  // Bubble Data API
+  BUBBLE_API_TOKEN: process.env.BUBBLE_API_TOKEN,
+  BUBBLE_DATA_API_URL: process.env.BUBBLE_DATA_API_URL,
 };
 
 // ============ VALIDATION ============
@@ -20,28 +20,221 @@ if (!CONFIG.BRAND_API_KEY) {
   console.error("❌ BRAND_API_KEY is not set in environment variables");
   process.exit(1);
 }
-if (!CONFIG.BUBBLE_WEBHOOK_URL) {
-  console.error("❌ BUBBLE_WEBHOOK_URL is not set in environment variables");
+if (!CONFIG.BUBBLE_API_TOKEN || !CONFIG.BUBBLE_DATA_API_URL) {
+  console.error("❌ BUBBLE_API_TOKEN or BUBBLE_DATA_API_URL is not set");
   process.exit(1);
 }
 
-// ============ SEND TO BUBBLE ============
-async function sendToBubble(data) {
-  try {
-    const response = await fetch(CONFIG.BUBBLE_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
+// ============ IN-MEMORY ACCOUNT STORE ============
+const accountStore = new Map(); // tradelocker_acc_id → { bubbleId, fields... } or null
 
-    if (!response.ok) {
-      console.error(`❌ Bubble responded with ${response.status}: ${await response.text()}`);
-    } else {
-      console.log(`✅ Sent to Bubble: account=${data.accountId} balance=${data.balance} equity=${data.equity}`);
-    }
-  } catch (err) {
-    console.error("❌ Error sending to Bubble:", err.message);
+// ============ BUBBLE DATA API HELPERS ============
+async function bubbleGet(table, constraints) {
+  const params = new URLSearchParams({
+    api_token: CONFIG.BUBBLE_API_TOKEN,
+    constraints: JSON.stringify(constraints),
+  });
+  const url = `${CONFIG.BUBBLE_DATA_API_URL}/${table}?${params}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Bubble GET ${table} failed: ${res.status} ${await res.text()}`);
   }
+  const json = await res.json();
+  return json.response.results;
+}
+
+async function bubblePatch(table, id, body) {
+  const url = `${CONFIG.BUBBLE_DATA_API_URL}/${table}/${id}?api_token=${CONFIG.BUBBLE_API_TOKEN}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`Bubble PATCH ${table}/${id} failed: ${res.status} ${await res.text()}`);
+  }
+}
+
+// ============ FETCH ACCOUNT DATA (LAZY) ============
+async function fetchAccountData(accId) {
+  // Already cached (either data or null)
+  if (accountStore.has(accId)) return accountStore.get(accId);
+
+  try {
+    // 1. Fetch UserChallengeLevel
+    const uclResults = await bubbleGet("UserChallengeLevel", [
+      { key: "tradelocker_acc_id", constraint_type: "equals", value: accId },
+    ]);
+
+    if (!uclResults || uclResults.length === 0) {
+      console.log(`⚠️ No UCL found for ${accId} — skipping`);
+      accountStore.set(accId, null);
+      return null;
+    }
+
+    const ucl = uclResults[0];
+
+    // 2. Fetch TradeLockerAccount for equity_rollover
+    const tlaResults = await bubbleGet("TradeLockerAccount", [
+      { key: "acc_id", constraint_type: "equals", value: accId },
+    ]);
+
+    const tla = tlaResults && tlaResults.length > 0 ? tlaResults[0] : null;
+
+    if (!tla || tla.status !== "ACTIVE") {
+      console.log(`⚠️ TLA for ${accId} not found or not ACTIVE — skipping`);
+      accountStore.set(accId, null);
+      return null;
+    }
+
+    const entry = {
+      bubbleId: ucl._id,
+      equityRollover: parseFloat(tla.equity_rollover) || 0,
+      // UCL fields from Bubble
+      StartBalance: parseFloat(ucl["Start Balance"]) || 0,
+      minDailyDrawdown: parseFloat(ucl["min_daily_drawdown"]) || 0,
+      minTotalDrawdown: parseFloat(ucl["min_total_drawdown"]) || 0,
+      // Computed fields (initialize from Bubble or 0)
+      ClosedProfit: parseFloat(ucl["Closed Profit"]) || 0,
+      CurrentBalance: parseFloat(ucl["Current Balance"]) || 0,
+      DDD: parseFloat(ucl["DDD"]) || 0,
+      TDD: parseFloat(ucl["TDD"]) || 0,
+      Equity: parseFloat(ucl["Equity"]) || 0,
+      Losses: parseFloat(ucl["Losses"]) || 0,
+      OpenProfit: parseFloat(ucl["Open Profit"]) || 0,
+      MaxBalance: parseFloat(ucl["Max Balance"]) || 0,
+      Costs: parseFloat(ucl["Costs"]) || 0,
+      Revenue: parseFloat(ucl["Revenue"]) || 0,
+      "Revenue-Costs": parseFloat(ucl["Revenue-Costs"]) || 0,
+      MaxDDD: parseFloat(ucl["Max DDD"]) || 0,
+      MaxTDD: parseFloat(ucl["Max TDD"]) || 0,
+      "DDD%": parseFloat(ucl["DDD%"]) || 0,
+      "TDD%": parseFloat(ucl["TDD%"]) || 0,
+      "profit%": parseFloat(ucl["profit%"]) || 0,
+      "MaxDDD%": parseFloat(ucl["MaxDDD%"]) || 0,
+      "MaxTDD%": parseFloat(ucl["MaxTDD%"]) || 0,
+      AllTradesClosed: false,
+      FirstOpenTradeDate: ucl["First open trade date"] || null,
+    };
+
+    accountStore.set(accId, entry);
+    console.log(`📥 Loaded UCL for ${accId} (bubble id: ${entry.bubbleId}, StartBalance: ${entry.StartBalance})`);
+    return entry;
+  } catch (err) {
+    console.error(`❌ Error fetching data for ${accId}:`, err.message);
+    // Don't cache on error — retry next time
+    return undefined;
+  }
+}
+
+// ============ COMPUTE FIELDS ============
+function computeFields(accId, wsData) {
+  const entry = accountStore.get(accId);
+  if (!entry) return null;
+
+  const balance = wsData.balance;
+  const equity = wsData.equity;
+  const marginUsed = wsData.marginUsed;
+  const S = entry.StartBalance;
+
+  // --- Stage 1 ---
+  entry.ClosedProfit = balance > 0 ? balance - S : entry.ClosedProfit;
+  entry.CurrentBalance = balance > 0 ? balance : entry.CurrentBalance;
+  entry.DDD = Math.max(0, entry.equityRollover - equity);
+  entry.TDD = Math.max(0, S - equity);
+  entry.Equity = equity;
+  entry.Losses = Math.max(0, S - entry.CurrentBalance);
+  entry.OpenProfit = marginUsed;
+  entry.AllTradesClosed = marginUsed === 0;
+  entry.MaxBalance = Math.max(balance, entry.MaxBalance);
+  entry.Costs = entry.CurrentBalance - S;
+
+  const equityMinusStart = equity - S;
+  if (equityMinusStart > entry.TDD) {
+    entry.Revenue = S * (1 - equity / equityMinusStart);
+  } else {
+    entry.Revenue = S * (entry["TDD%"] || 0);
+  }
+  entry["Revenue-Costs"] = entry.Revenue - entry.Costs;
+
+  // --- Stage 2 ---
+  entry.MaxDDD = Math.max(entry.DDD, entry.MaxDDD);
+  entry.MaxTDD = Math.max(entry.TDD, entry.MaxTDD);
+
+  const dailyDenom = entry.minDailyDrawdown * S;
+  entry["DDD%"] = dailyDenom > 0 ? entry.DDD / dailyDenom : 0;
+
+  const totalDenom = entry.minTotalDrawdown * S;
+  entry["TDD%"] = totalDenom > 0 ? entry.TDD / totalDenom : 0;
+
+  entry["profit%"] = Math.max(0, entry.ClosedProfit / S);
+
+  // --- Stage 3 ---
+  entry["MaxDDD%"] = Math.max(entry["DDD%"], entry["MaxDDD%"]);
+  entry["MaxTDD%"] = Math.max(entry["TDD%"], entry["MaxTDD%"]);
+
+  return entry;
+}
+
+// ============ UPDATE BUBBLE ============
+async function updateBubble(accId) {
+  const entry = accountStore.get(accId);
+  if (!entry) return;
+
+  const body = {
+    "Closed Profit": entry.ClosedProfit,
+    "Current Balance": entry.CurrentBalance,
+    "DDD": entry.DDD,
+    "TDD": entry.TDD,
+    "Equity": entry.Equity,
+    "Losses": entry.Losses,
+    "Open Profit": entry.OpenProfit,
+    "Max Balance": entry.MaxBalance,
+    "Costs": entry.Costs,
+    "Revenue": entry.Revenue,
+    "Revenue-Costs": entry["Revenue-Costs"],
+    "Max DDD": entry.MaxDDD,
+    "Max TDD": entry.MaxTDD,
+    "DDD%": entry["DDD%"],
+    "TDD%": entry["TDD%"],
+    "profit%": entry["profit%"],
+    "MaxDDD%": entry["MaxDDD%"],
+    "MaxTDD%": entry["MaxTDD%"],
+    "All trades closed": entry.AllTradesClosed,
+  };
+
+  // Set First open trade date if not yet set
+  if (!entry.FirstOpenTradeDate) {
+    const now = new Date().toISOString();
+    body["First open trade date"] = now;
+    entry.FirstOpenTradeDate = now; // mark in cache so we don't set it again
+  }
+
+  try {
+    await bubblePatch("UserChallengeLevel", entry.bubbleId, body);
+    console.log(`✅ PATCH UCL for ${accId} | equity=${entry.Equity} balance=${entry.CurrentBalance}`);
+  } catch (err) {
+    console.error(`❌ PATCH failed for ${accId}:`, err.message);
+  }
+}
+
+// ============ PROCESS ACCOUNT STATUS ============
+async function processAccountStatus(wsData) {
+  const accId = wsData.accountId;
+  const equity = wsData.equity;
+
+  // Skip if equity is 0
+  if (equity === 0) return;
+
+  // Fetch from Bubble if not cached
+  const entry = await fetchAccountData(accId);
+
+  // Skip if UCL not found or fetch failed
+  if (!entry) return;
+
+  // Compute and update
+  computeFields(accId, wsData);
+  await updateBubble(accId);
 }
 
 // ============ SOCKET CONNECTION ============
@@ -73,13 +266,9 @@ socket.on("stream", (data) => {
     return;
   }
 
-  // AccountStatus — send balance & equity to Bubble
+  // AccountStatus — compute UCL fields and send to Bubble
   if (data.type === "AccountStatus") {
-    // DEBUG: log raw data for D#1860538
-    if (data.accountId === "D#1860538") {
-      console.log("🔍 RAW D#1860538:", JSON.stringify(data));
-    }
-    const payload = {
+    const wsData = {
       accountId: data.accountId,
       balance: parseFloat(data.balance) || 0,
       equity: parseFloat(data.equity) || 0,
@@ -87,8 +276,8 @@ socket.on("stream", (data) => {
       synced: syncComplete,
     };
 
-    console.log(`📊 AccountStatus: ${payload.accountId} | balance: ${payload.balance} | equity: ${payload.equity}`);
-    sendToBubble(payload);
+    console.log(`📊 AccountStatus: ${wsData.accountId} | balance: ${wsData.balance} | equity: ${wsData.equity}`);
+    processAccountStatus(wsData);
   }
 });
 
@@ -124,3 +313,7 @@ process.on("SIGTERM", () => {
 console.log("🚀 TradeLocker → Bubble bridge starting...");
 console.log(`   Server: ${CONFIG.SERVER_URL}`);
 console.log(`   Type: ${CONFIG.TYPE}`);
+
+// ============ HTTP SERVER (Railway keep-alive) ============
+const http = require("http");
+http.createServer((_, res) => res.end("ok")).listen(process.env.PORT || 3000);
