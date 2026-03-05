@@ -111,8 +111,8 @@ async function fetchAccountData(accId) {
       "DDD%": parseFloat(ucl["DDD %"]) || 0,
       "TDD%": parseFloat(ucl["TDD %"]) || 0,
       "profit%": parseFloat(ucl["profit %"]) || 0,
-      "MaxDDD%": parseFloat(ucl["Max DDD %"]) || 0,
-      "MaxTDD%": parseFloat(ucl["Max TDD %"]) || 0,
+      "MaxDDD%": parseFloat(ucl["Max DDD%"]) || 0,
+      "MaxTDD%": parseFloat(ucl["Max TDD%"]) || 0,
       AllTradesClosed: false,
       FirstOpenTradeDate: ucl["First open trade date"] || null,
     };
@@ -198,8 +198,8 @@ async function updateBubble(accId) {
     "DDD %": entry["DDD%"],
     "TDD %": entry["TDD%"],
     "profit %": entry["profit%"],
-    "Max DDD %": entry["MaxDDD%"],
-    "Max TDD %": entry["MaxTDD%"],
+    "Max DDD%": entry["MaxDDD%"],
+    "Max TDD%": entry["MaxTDD%"],
     "All trades closed": entry.AllTradesClosed,
   };
 
