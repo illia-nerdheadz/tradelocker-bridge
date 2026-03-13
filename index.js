@@ -28,6 +28,64 @@ if (!CONFIG.BUBBLE_API_TOKEN || !CONFIG.BUBBLE_DATA_API_URL) {
 // ============ IN-MEMORY ACCOUNT STORE ============
 const accountStore = new Map(); // tradelocker_acc_id → { bubbleId, fields... } or null
 
+// ============ DAILY RESET TRACKING ============
+const RESET_TIMEZONE = process.env.RESET_TIMEZONE || "Europe/Kyiv";
+
+function getTzDateTime(timezone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const get = (t) => parts.find((p) => p.type === t).value;
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    hour: parseInt(get("hour")),
+    minute: parseInt(get("minute")),
+  };
+}
+
+// Initialize: if already past 00:20 today, mark today as reset so we don't double-reset on startup
+const _initTz = getTzDateTime(RESET_TIMEZONE);
+let lastResetDate =
+  _initTz.hour > 0 || _initTz.minute >= 20 ? _initTz.date : null;
+console.log(`📅 Daily reset timezone: ${RESET_TIMEZONE} | lastResetDate: ${lastResetDate}`);
+
+async function checkAndPerformDailyReset() {
+  const { date, hour, minute } = getTzDateTime(RESET_TIMEZONE);
+  // Trigger at 00:20 or later, once per day
+  if ((hour > 0 || minute >= 20) && lastResetDate !== date) {
+    lastResetDate = date;
+    console.log(`🔄 Daily rollover reset triggered for ${date}`);
+    for (const [accId, entry] of accountStore.entries()) {
+      if (!entry) continue;
+      try {
+        // Re-fetch equity_rollover from Bubble
+        const tlaResults = await bubbleGet("TradeLockerAccount", [
+          { key: "acc_id", constraint_type: "equals", value: accId },
+        ]);
+        const tla = tlaResults && tlaResults.length > 0 ? tlaResults[0] : null;
+        if (tla && tla.status === "ACTIVE") {
+          entry.equityRollover = parseFloat(tla.equity_rollover) || 0;
+        }
+        // Reset daily DDD fields
+        entry.DDD = 0;
+        entry.MaxDDD = 0;
+        entry["DDD%"] = 0;
+        entry["MaxDDD%"] = 0;
+        console.log(`  ✅ ${accId}: equityRollover=${entry.equityRollover}, DDD fields reset`);
+      } catch (err) {
+        console.error(`  ❌ Daily reset failed for ${accId}:`, err.message);
+      }
+    }
+    console.log("✅ Daily reset complete");
+  }
+}
+
 // ============ BUBBLE DATA API HELPERS ============
 async function bubbleGet(table, constraints) {
   const params = new URLSearchParams({
@@ -225,6 +283,9 @@ async function processAccountStatus(wsData) {
 
   // Skip if equity is 0
   if (equity === 0) return;
+
+  // Check if daily reset is needed (runs at 00:20 in RESET_TIMEZONE)
+  await checkAndPerformDailyReset();
 
   // Fetch from Bubble if not cached
   const entry = await fetchAccountData(accId);
